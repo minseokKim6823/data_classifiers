@@ -1,31 +1,12 @@
 import os
-
 import shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from PIL import Image
 import imagehash
+import glob
 
 
-def average_hash_from_folder(folder_path):
-    hashes = []
-    for filename in os.listdir(folder_path):
-        path = os.path.join(folder_path, filename)
-        if filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-            try:
-                img = Image.open(path)
-                h = imagehash.average_hash(img, hash_size=128)
-                hashes.append(h.hash.astype(np.float64))  # 핵심: 내부 numpy 배열 추출
-            except Exception as e:
-                print(f"[!] 해시 실패: {filename}, 에러: {e}")
-
-    if not hashes:
-        return None
-
-    avg_hash_array = np.mean(hashes, axis=0) > 0.5  # 평균 내고 임계값 0.5 초과면 True
-    return imagehash.ImageHash(avg_hash_array)
-
-
-def classify_image(target_path, label_hashes, threshold):
+def classify_image(target_path, label_hashes, threshold): # 해시값 기반 분류
     try:
         img = Image.open(target_path)
         img_hash = imagehash.average_hash(img, hash_size=128)
@@ -35,7 +16,7 @@ def classify_image(target_path, label_hashes, threshold):
 
         for label, ref_hash in label_hashes.items():
             diff = img_hash - ref_hash
-            similarity = 1 - (diff / 128**2)
+            similarity = 1 - (diff / 16**2)
             print(f"[DEBUG] {label} 유사도: {similarity:.2f}")
             if similarity > best_score:
                 best_score = similarity
@@ -48,30 +29,6 @@ def classify_image(target_path, label_hashes, threshold):
         print(f"[!] 이미지 분류 실패: {target_path}, 에러: {e}")
         return "unmatched", 0
 
-
-def classify_by_folders(target_path, template_root, result_root, threshold):
-    # 1. 기준 폴더들 해시화
-    label_hashes = {}
-    for label in os.listdir(template_root):
-        folder_path = os.path.join(template_root, label)
-        if os.path.isdir(folder_path):
-            h = average_hash_from_folder(folder_path)
-            if h:
-                label_hashes[label] = h
-                print(f"[+] 기준 해시 생성됨: {label}")
-
-    # 2. 분류
-    label, score = classify_image(target_path, label_hashes, threshold)
-    filename = os.path.basename(target_path)
-
-    dst_dir = os.path.join(result_root, label)
-    os.makedirs(dst_dir, exist_ok=True)
-    shutil.copy(target_path, os.path.join(dst_dir, filename))
-    print(f"[→] {filename} → {label} (유사도: {score:.2f})")
-
-
-
-
 def calc_diff(template_path, target_hash):
     try:
         template_image = Image.open(template_path)
@@ -81,55 +38,71 @@ def calc_diff(template_path, target_hash):
         return template_path, similarity_percentage
     except Exception as e:
         print(f"이미지 로드 실패: {template_path}, 에러: {e}")
-        return template_path, float("inf")
+        return template_path, -1
+
+def classify_folder_batch(target_image_path, template_dir, result_dir, thresh_hold):
+    target_image = Image.open(target_image_path)
+    target_hash = imagehash.average_hash(target_image, hash_size=128)
+
+    image_files = glob.glob(os.path.join(template_dir, "**", "*.*"), recursive=True)
+    image_files = [f for f in image_files if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff"))]
+
+    if not image_files:
+        print(f"[!] 템플릿 디렉토리에 이미지 파일이 없습니다: {template_dir}")
+        return
+
+    best_match = None
+    best_score = -1
+
+    for template_path in image_files:
+        try:
+            template_image = Image.open(template_path)
+            template_hash = imagehash.average_hash(template_image, hash_size=128)
+            diff = target_hash - template_hash
+            similarity = 1 - (diff / 128**2)
+            print(f"[→] {os.path.basename(template_path)}: 유사도 {similarity:.2f}")
+
+            if similarity > best_score:
+                best_score = similarity
+                best_match = template_path
+        except Exception as e:
+            print(f"[!] 비교 실패: {template_path}, 에러: {e}")
+
+        # 저장 로직
+    filename = os.path.basename(target_image_path)
+
+    if best_match and best_score >= thresh_hold:
+        # ✅ 가장 유사한 reference 이미지의 상위 폴더명
+        rel_path = os.path.relpath(best_match, template_dir)
+        top_folder = rel_path.split(os.sep)[0]  # ex: '소득금액증명'
+
+        output_dir = os.path.join(result_dir, top_folder)
+        os.makedirs(output_dir, exist_ok=True)
+
+        shutil.copy(target_image_path, os.path.join(output_dir, filename))
+        print(f"[✓] 저장됨: {os.path.join(output_dir, filename)} (유사도: {best_score:.2f})")
+    else:
+        unmatched_dir = os.path.join(result_dir, "unmatched")
+        os.makedirs(unmatched_dir, exist_ok=True)
+        shutil.copy(target_image_path, os.path.join(unmatched_dir, filename))
+        print(f"[→] 유사도 미달로 unmatched에 저장됨 (최고 유사도: {best_score:.2f})")
 
 
-def classify_by_hash(dir, template_dir, result_dir, thresh_hold):
-    timage = Image.open(dir)
-    target_hash = imagehash.average_hash(timage, hash_size=128)
+def classify_multiple_images(dir, template_dir, result_dir, threshold):
+    if not os.path.exists(dir):
+        print(f"[!] 입력 디렉토리가 존재하지 않습니다: {dir}")
+        return
 
-    image_files = [
-        os.path.join(template_dir, filename)
-        for filename in os.listdir(template_dir)
+    image_paths = [
+        os.path.join(dir, filename)
+        for filename in os.listdir(dir)
         if filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff"))
-    ]#이미지 해시화
+    ]
 
-    # 결과 저장 경로 생성
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir)
+    from functools import partial
+    task = partial(classify_folder_batch, template_dir=template_dir, result_dir=result_dir, thresh_hold=threshold)
 
-    # 결과 저장 경로 생성
 
-    with ThreadPoolExecutor() as executor:
-        # 병렬로 작업 실행
-        results = executor.map(calc_diff, image_files, [target_hash] * len(image_files))
-
-        for template_path, similarity_percentage in results:
-            if similarity_percentage > thresh_hold:
-                try:
-                    # 유사한 이미지 저장 (파일명에 일치율 포함)
-                    filename = os.path.basename(template_path)
-                    name, ext = os.path.splitext(filename)
-                    new_filename = f"{name}_similarity_{similarity_percentage:.2f}{ext}"
-                    destination_path = os.path.join(result_dir, new_filename)
-                    shutil.copy(template_path, destination_path)
-                    print(
-                        f"유사 이미지 저장: {destination_path} (차이: {similarity_percentage})"
-                    )
-                except Exception as e:
-                    print(f"이미지 복사 실패: {template_path}, 에러: {e}")
-            else:
-                try:
-                    # 유사한 이미지 저장 (파일명에 일치율 포함)
-                    filename = os.path.basename(template_path)
-                    name, ext = os.path.splitext(filename)
-                    new_filename = f"{name}_similarity_{similarity_percentage:.2f}{ext}"
-                    destination_path = os.path.join(result_dir, new_filename)
-                    shutil.copy(template_path, destination_path)
-                    print(
-                        f"유사 이미지 저장: {destination_path} (차이: {similarity_percentage})"
-                    )
-                except Exception as e:
-                    print(f"이미지 복사 실패: {template_path}, 에러: {e}")
-
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        executor.map(task, image_paths)
 
