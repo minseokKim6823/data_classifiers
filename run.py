@@ -1,8 +1,9 @@
 import argparse
 from img_classifiers import classify_multiple_images
-
+from multiprocessing import freeze_support
 
 if __name__ == "__main__":
+    freeze_support()
     parser = argparse.ArgumentParser(description="이미지 → 기준 폴더 자동 분류")
     parser.add_argument("--dir", required=True, help="입력 이미지 (1장)")
     parser.add_argument("--template_dir", required=True, help="기준 폴더 경로 (A/B/C...)")
@@ -12,6 +13,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     classify_multiple_images(args.dir, args.template_dir, args.result_dir, args.thresh_hold)
+
 
 
 '''
